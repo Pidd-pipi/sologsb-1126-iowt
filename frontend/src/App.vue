@@ -8,12 +8,14 @@ import { useRoute } from 'vue-router'
 import { useSiteStore } from '@/stores/siteStore'
 import { useProfileStore } from '@/stores/profileStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { resolveAmapKey } from '@/hooks/useAmapLoader'
 
 const route = useRoute()
 const siteStore = useSiteStore()
 const profileStore = useProfileStore()
 const uiStore = useUiStore()
+const conflictStore = useConflictStore()
 
 const activeMenu = computed(() => {
   const path = route.path
@@ -33,7 +35,9 @@ onMounted(async () => {
   await Promise.all([
     siteStore.load(),
     profileStore.load(),
-    uiStore.loadVetos()
+    uiStore.loadVetos(),
+    conflictStore.load(),
+    conflictStore.refreshPendingCount()
   ])
 })
 </script>

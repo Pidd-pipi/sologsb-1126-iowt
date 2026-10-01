@@ -1,19 +1,24 @@
 <script setup lang="ts">
 /**
  * `/scoring` 权重与评分 —— 拖动各因子权重条，名次随权重实时刷新，可另存为季节方案。
- * 消费 ScoreProfile、Campsite；复用 <WeightEditor>、<GradeBadge>。
+ * 消费 ScoreProfile、Campsite；复用 <WeightEditor>、<GradeBadge>、<ConflictDialog>。
+ * 保存时做乐观并发核对：若方案在别处被改过，弹出冲突框并列变化、留草稿、合并后再启用重算。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import WeightEditor from '@/components/common/WeightEditor.vue'
 import GradeBadge from '@/components/common/GradeBadge.vue'
+import ConflictDialog from '@/components/common/ConflictDialog.vue'
+import ConflictHistory from '@/components/common/ConflictHistory.vue'
 import { useSiteStore } from '@/stores/siteStore'
 import { useProfileStore } from '@/stores/profileStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { useRanking } from '@/hooks/useRanking'
 import { NORMALIZE_LABELS, SEASONS, weightSumGuard } from '@/types/score'
-import type { FactorWeights, NormalizeMethod, GradeThresholds } from '@/types/score'
+import type { FactorWeights, NormalizeMethod, GradeThresholds, ScoreProfile } from '@/types/score'
+import type { ConflictResolution } from '@/types/conflict'
 import { formatScore } from '@/utils/format'
 import { weightSum } from '@/utils/score'
 
@@ -21,13 +26,15 @@ const router = useRouter()
 const siteStore = useSiteStore()
 const profileStore = useProfileStore()
 const uiStore = useUiStore()
+const conflictStore = useConflictStore()
 
-/** 当前启用的方案快照，用于「恢复当前方案」 */
+/** 当前启用的方案快照，用于「恢复当前方案」与版本核对 */
 const activeSnapshot = ref<{
   weights: FactorWeights
   normalize: NormalizeMethod
   thresholds: GradeThresholds
   season: string
+  version: number
 } | null>(null)
 
 function snapshotActive(): void {
@@ -37,13 +44,15 @@ function snapshotActive(): void {
     weights: { ...p.weights },
     normalize: p.normalize,
     thresholds: { ...p.thresholds },
-    season: p.season
+    season: p.season,
+    version: p.version
   }
   uiStore.syncFromProfile(p.weights, p.normalize, p.thresholds, p.season)
 }
 
 onMounted(() => {
   snapshotActive()
+  void conflictStore.load()
 })
 
 watch(
@@ -147,6 +156,7 @@ async function confirmSave(): Promise<void> {
     thresholds: { ...uiStore.workingThresholds },
     season: saveForm.value.season,
     active: saveForm.value.activate,
+    version: 1,
     note:
       saveForm.value.note.trim() ||
       `权重合计 ${totalWeight.value}，由「${profileStore.activeProfile?.name ?? '默认'}」另存`,
@@ -160,6 +170,103 @@ async function confirmSave(): Promise<void> {
   uiStore.dirty = false
   saveDialog.value = false
   ElMessage.success(`方案「${name}」已保存${saveForm.value.activate ? '并启用' : ''}`)
+}
+
+/* --------------------------- 保存当前方案（带版本核对） --------------------------- */
+const conflictDialog = ref(false)
+const conflictData = ref<{
+  localDraft: unknown
+  remoteSnapshot: unknown
+  baseVersion: number
+  remoteVersion: number
+  remoteUpdatedAt?: string
+  profileId: number
+} | null>(null)
+
+async function saveCurrentProfile(): Promise<void> {
+  const active = profileStore.activeProfile
+  if (!active || typeof active.id !== 'number') {
+    ElMessage.warning('当前没有启用中的方案')
+    return
+  }
+  const baseVersion = activeSnapshot.value?.version ?? active.version
+  const patch: Partial<ScoreProfile> = {
+    weights: { ...uiStore.workingWeights },
+    normalize: uiStore.workingNormalize,
+    thresholds: { ...uiStore.workingThresholds }
+  }
+  const result = await profileStore.updateProfile(active.id, patch, baseVersion)
+  if (result.conflict && result.current) {
+    // 版本冲突：弹出核对框
+    conflictData.value = {
+      localDraft: patch,
+      remoteSnapshot: result.current,
+      baseVersion,
+      remoteVersion: result.current.version,
+      remoteUpdatedAt: result.current.updatedAt,
+      profileId: active.id
+    }
+    conflictDialog.value = true
+    // 先落一条「待处理」冲突记录
+    await conflictStore.add({
+      entityType: 'profile',
+      entityId: active.id,
+      entityName: active.name,
+      conflictType: 'version-mismatch',
+      summary: `保存时发现方案已被别处修改（v${baseVersion} → v${result.current.version}）`,
+      localDraft: patch,
+      remoteSnapshot: result.current,
+      baseVersion,
+      remoteVersion: result.current.version,
+      resolution: 'pending'
+    })
+  } else {
+    snapshotActive()
+    uiStore.dirty = false
+    ElMessage.success('方案已保存，名次已按新权重重算')
+  }
+}
+
+async function onConflictResolve(resolution: ConflictResolution): Promise<void> {
+  const data = conflictData.value
+  if (!data) return
+  const active = profileStore.activeProfile
+  if (!active || typeof active.id !== 'number') return
+
+  if (resolution === 'kept-remote') {
+    // 放弃本地，采用远端
+    const remote = data.remoteSnapshot as ScoreProfile
+    uiStore.syncFromProfile(remote.weights, remote.normalize, remote.thresholds, remote.season)
+    uiStore.dirty = false
+    snapshotActive()
+  } else if (resolution === 'kept-local') {
+    // 保留本地：强制保存（不带版本核对）
+    const patch = data.localDraft as Partial<ScoreProfile>
+    await profileStore.updateProfile(data.profileId, patch)
+    snapshotActive()
+    uiStore.dirty = false
+  } else {
+    // 合并：以本地为基础，合并远端的非冲突字段（这里简单采用本地权重 + 远端阈值）
+    const patch = data.localDraft as Partial<ScoreProfile>
+    const remote = data.remoteSnapshot as ScoreProfile
+    const merged: Partial<ScoreProfile> = {
+      ...patch,
+      thresholds: patch.thresholds ?? remote.thresholds
+    }
+    await profileStore.updateProfile(data.profileId, merged)
+    snapshotActive()
+    uiStore.dirty = false
+  }
+
+  // 更新最近一条冲突记录的处理结果
+  const records = conflictStore.ofEntity('profile', data.profileId)
+  const pending = records.find((r) => r.resolution === 'pending')
+  if (pending && typeof pending.id === 'number') {
+    await conflictStore.resolve(pending.id, resolution)
+  }
+  conflictDialog.value = false
+  conflictData.value = null
+  ElMessage.success('冲突已处理，方案已保存并启用')
 }
 
 async function useProfile(id: number | undefined): Promise<void> {
@@ -187,14 +294,48 @@ async function removeProfileRow(id: number | undefined): Promise<void> {
     return
   }
   try {
-    await ElMessageBox.confirm('确认删除该权重方案？', '提示', { type: 'warning' })
+    await ElMessageBox.confirm(
+      '确认删除该权重方案？引用它的营位将转入「待选择方案」，不会静默回退到别的方案。',
+      '提示',
+      { type: 'warning' }
+    )
     await profileStore.removeProfile(id)
     const fallback = profileStore.list[0]
     if (fallback && typeof fallback.id === 'number' && !profileStore.activeProfile) {
       await profileStore.activate(fallback.id)
     }
     snapshotActive()
-    ElMessage.success('方案已删除')
+    ElMessage.success('方案已删除，引用它的营位已转入待选择')
+  } catch {
+    /* 用户取消 */
+  }
+}
+
+/** 显式停用方案：引用它的营位转入待选择，不静默回退。 */
+async function disableProfile(id: number | undefined): Promise<void> {
+  if (typeof id !== 'number') return
+  const profile = profileStore.byId(id)
+  if (!profile) return
+  try {
+    await ElMessageBox.confirm(
+      `确认停用方案「${profile.name}」？引用它的营位将转入「待选择方案」，需手动指定新方案。`,
+      '提示',
+      { type: 'warning' }
+    )
+    const result = await profileStore.updateProfile(id, { active: false }, profile.version)
+    if (result.conflict && result.current) {
+      ElMessage.warning('方案已被别处修改，请刷新后重试')
+      return
+    }
+    // 若停用的是当前启用方案，自动启用另一个（但不回退营位的 defaultProfileId）
+    if (profile.active) {
+      const other = profileStore.list.find((p) => p.id !== id)
+      if (other && typeof other.id === 'number') {
+        await profileStore.activate(other.id)
+      }
+    }
+    snapshotActive()
+    ElMessage.success('方案已停用，引用它的营位已转入待选择')
   } catch {
     /* 用户取消 */
   }
@@ -213,6 +354,7 @@ async function removeProfileRow(id: number | undefined): Promise<void> {
       </div>
       <div class="page-actions">
         <el-button @click="revertToActive">恢复当前方案</el-button>
+        <el-button @click="saveCurrentProfile">保存当前方案</el-button>
         <el-button type="primary" @click="openSaveDialog">另存为季节方案</el-button>
       </div>
     </div>
@@ -373,7 +515,7 @@ async function removeProfileRow(id: number | undefined): Promise<void> {
     <section class="panel">
       <div class="panel__head">
         <h2>权重方案库</h2>
-        <span class="weight-note">启用中的方案会被首页、详情页与地图共同采用</span>
+        <span class="weight-note">启用中的方案会被首页、详情页与地图共同采用；停用或删除方案会使引用它的营位转入待选择</span>
       </div>
       <el-table :data="profileStore.list" size="small" border>
         <el-table-column label="方案名" min-width="180">
@@ -393,16 +535,27 @@ async function removeProfileRow(id: number | undefined): Promise<void> {
         <el-table-column label="权重合计" width="106" align="center">
           <template #default="{ row }">{{ weightSum(row.weights) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="操作" width="300" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text type="primary" :disabled="row.active" @click="useProfile(row.id)">
               启用
+            </el-button>
+            <el-button size="small" text type="warning" :disabled="!row.active" @click="disableProfile(row.id)">
+              停用
             </el-button>
             <el-button size="small" text @click="copyProfile(row.id)">复制</el-button>
             <el-button size="small" text type="danger" @click="removeProfileRow(row.id)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2>方案冲突记录</h2>
+        <span class="weight-note">多人同时编辑或方案被停用/移除时的版本核对与处理留痕</span>
+      </div>
+      <ConflictHistory v-if="profileStore.activeProfile" entity-type="profile" :entity-id="profileStore.activeProfile.id" :limit="8" />
     </section>
 
     <el-dialog v-model="saveDialog" title="另存为季节方案" width="520px">
@@ -439,6 +592,21 @@ async function removeProfileRow(id: number | undefined): Promise<void> {
         <el-button type="primary" @click="confirmSave">保存方案</el-button>
       </template>
     </el-dialog>
+
+    <ConflictDialog
+      v-if="conflictData"
+      v-model="conflictDialog"
+      entity-type="profile"
+      :entity-name="profileStore.activeProfile?.name ?? '方案'"
+      conflict-type="version-mismatch"
+      :summary="`保存时发现方案已被别处修改（v${conflictData.baseVersion} → v${conflictData.remoteVersion}），请核对后选择处理方式`"
+      :local-draft="conflictData.localDraft"
+      :remote-snapshot="conflictData.remoteSnapshot"
+      :base-version="conflictData.baseVersion"
+      :remote-version="conflictData.remoteVersion"
+      :remote-updated-at="conflictData.remoteUpdatedAt"
+      @resolve="onConflictResolve"
+    />
   </div>
 </template>
 

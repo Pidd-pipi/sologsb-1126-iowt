@@ -1,18 +1,21 @@
 <script setup lang="ts">
 /**
  * `/sites/:id` 营位详情 —— 上部地图定位与基本信息，中部因子打分表，下部否决记录与多轮复核。
- * 消费四个模型；复用 <MapPanel>、<FactorScoreBar>、<GradeBadge>。
+ * 消费四个模型；复用 <MapPanel>、<FactorScoreBar>、<GradeBadge>、<ConflictHistory>。
+ * 引用方案被停用/移除时显示「待选择」并可重新指定；详情页保留冲突记录。
  */
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import MapPanel from '@/components/common/MapPanel.vue'
 import FactorScoreBar from '@/components/common/FactorScoreBar.vue'
 import GradeBadge from '@/components/common/GradeBadge.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
+import ConflictHistory from '@/components/common/ConflictHistory.vue'
 import { useSiteStore } from '@/stores/siteStore'
 import { useProfileStore } from '@/stores/profileStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { useRanking } from '@/hooks/useRanking'
 import { FACTOR_META, NORMALIZE_LABELS } from '@/types/score'
 import { ASPECT_TYPES, SURFACE_TYPES, ACCESS_MODES } from '@/types/campsite'
@@ -30,6 +33,7 @@ const router = useRouter()
 const siteStore = useSiteStore()
 const profileStore = useProfileStore()
 const uiStore = useUiStore()
+const conflictStore = useConflictStore()
 
 const siteId = computed(() => Number(route.params.id))
 const site = computed(() => siteStore.byId(siteId.value))
@@ -56,6 +60,28 @@ function openSite(id: number): void {
 const grade = computed(() => scoreRow.value?.grade ?? 'C')
 const factorHistory = computed(() => siteStore.factorsOf(siteId.value))
 const vetoList = computed(() => uiStore.vetosOf(siteId.value))
+
+onMounted(() => {
+  void conflictStore.load()
+})
+
+/** 营位引用的方案（若已停用/移除则为 null） */
+const assignedProfile = computed(() => {
+  const s = site.value
+  if (!s || s.defaultProfileId == null) return null
+  return profileStore.byId(s.defaultProfileId)
+})
+
+/** 为待选择营位指定新方案 */
+async function assignProfile(profileId: number): Promise<void> {
+  if (typeof siteId.value !== 'number' || typeof profileId !== 'number') return
+  const result = await siteStore.assignProfile(siteId.value, profileId, site.value?.version)
+  if (result.conflict) {
+    ElMessage.warning('营位信息已被别处修改，请刷新后重试')
+    return
+  }
+  ElMessage.success('已指定新方案，名次已重算')
+}
 
 /* --------------------------- 多轮因子复核录入 --------------------------- */
 const showFactorForm = ref(false)
@@ -195,18 +221,27 @@ function startEdit(): void {
 
 async function saveEdit(): Promise<void> {
   if (!site.value) return
-  await siteStore.updateSite(siteId.value, {
-    name: editForm.name.trim() || site.value.name,
-    campName: editForm.campName.trim() || site.value.campName,
-    elevation: Number(editForm.elevation),
-    slope: Number(editForm.slope),
-    aspect: editForm.aspect,
-    surface: editForm.surface,
-    tentCapacity: Number(editForm.tentCapacity),
-    flatness: Number(editForm.flatness),
-    access: editForm.access,
-    note: editForm.note.trim()
-  })
+  const baseVersion = site.value.version
+  const result = await siteStore.updateSite(
+    siteId.value,
+    {
+      name: editForm.name.trim() || site.value.name,
+      campName: editForm.campName.trim() || site.value.campName,
+      elevation: Number(editForm.elevation),
+      slope: Number(editForm.slope),
+      aspect: editForm.aspect,
+      surface: editForm.surface,
+      tentCapacity: Number(editForm.tentCapacity),
+      flatness: Number(editForm.flatness),
+      access: editForm.access,
+      note: editForm.note.trim()
+    },
+    baseVersion
+  )
+  if (result.conflict && result.current) {
+    ElMessage.warning('营位信息已被别处修改，请刷新后重试')
+    return
+  }
   editing.value = false
   ElMessage.success('营位基础信息已更新')
 }
@@ -249,6 +284,34 @@ watch(
         <el-button type="primary" @click="startEdit">编辑基础信息</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="site.profilePending"
+      type="warning"
+      show-icon
+      :closable="false"
+      title="该营位处于「待选择方案」状态"
+      description="引用的权重方案已被停用或移除，不会静默回退到别的方案。请手动指定新方案后再查看名次。"
+      style="margin-bottom: 12px"
+    >
+      <div class="pending-assign">
+        <span class="pending-assign__label">指定方案：</span>
+        <el-select
+          :model-value="null"
+          placeholder="选择权重方案"
+          size="small"
+          style="width: 240px"
+          @update:model-value="(v: number) => assignProfile(v)"
+        >
+          <el-option
+            v-for="p in profileStore.list"
+            :key="p.id"
+            :label="`${p.name}${p.active ? '（启用中）' : ''}`"
+            :value="p.id"
+          />
+        </el-select>
+      </div>
+    </el-alert>
 
     <el-alert
       v-if="vetoList.length"
@@ -616,6 +679,14 @@ watch(
         </el-form-item>
       </el-form>
     </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2>冲突记录</h2>
+        <span class="weight-note">方案停用/移除、版本冲突、重新指定方案的留痕</span>
+      </div>
+      <ConflictHistory entity-type="site" :entity-id="siteId" :limit="10" />
+    </section>
   </div>
 
   <div v-else class="page">
@@ -646,5 +717,15 @@ watch(
 }
 .review-form {
   margin-bottom: 12px;
+}
+.pending-assign {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.pending-assign__label {
+  font-size: 13px;
+  color: var(--gb-ink);
 }
 </style>

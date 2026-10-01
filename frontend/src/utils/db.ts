@@ -12,16 +12,18 @@ import type { FactorAssessment } from '@/types/factor'
 import type { ScoreProfile } from '@/types/score'
 import { DEFAULT_WEIGHTS } from '@/types/score'
 import type { RiskVeto } from '@/types/veto'
+import type { ConflictRecord } from '@/types/conflict'
 
 export const DB_NAME = 'gbcampsite-db'
 /** 当前数据结构版本号 */
-export const DB_VERSION = 3
+export const DB_VERSION = 4
 
 export class GbCampsiteDatabase extends Dexie {
   sites!: Table<Campsite, number>
   factors!: Table<FactorAssessment, number>
   profiles!: Table<ScoreProfile, number>
   vetos!: Table<RiskVeto, number>
+  conflicts!: Table<ConflictRecord, number>
 
   constructor() {
     super(DB_NAME)
@@ -74,6 +76,31 @@ export class GbCampsiteDatabase extends Dexie {
             if (typeof s.tentCapacity !== 'number') s.tentCapacity = 1
           })
       })
+
+    // v4：新增 conflicts（冲突记录）表；为存量方案与营位补 version 与 profilePending 字段
+    this.version(4)
+      .stores({
+        sites: '++id, code, name, campName, surface, access, defaultProfileId, profilePending, updatedAt',
+        factors: '++id, siteId, assessedAt, assessor',
+        profiles: '++id, name, season, active, updatedAt',
+        vetos: '++id, siteId, type, judgedAt',
+        conflicts: '++id, entityType, entityId, conflictType, resolution, createdAt'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('profiles')
+          .toCollection()
+          .modify((p: Partial<ScoreProfile>) => {
+            if (typeof p.version !== 'number') p.version = 1
+          })
+        await tx
+          .table('sites')
+          .toCollection()
+          .modify((s: Partial<Campsite>) => {
+            if (typeof s.version !== 'number') s.version = 1
+            if (typeof s.profilePending !== 'boolean') s.profilePending = false
+          })
+      })
   }
 }
 
@@ -104,6 +131,7 @@ function seedProfiles(): ScoreProfile[] {
       thresholds: { gradeA: 78, gradeB: 58 },
       season: '四季通用',
       active: true,
+      version: 1,
       note: '默认方案，坡度、水源、落石三项权重略高，适用于大多数山谷营地。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -128,6 +156,7 @@ function seedProfiles(): ScoreProfile[] {
       thresholds: { gradeA: 82, gradeB: 62 },
       season: '夏季',
       active: false,
+      version: 1,
       note: '雨季强调风力遮蔽与水系距离，阈值分段避免极差归一被单个离群营位拉偏。',
       createdAt: SEED_TS,
       updatedAt: SEED_TS
@@ -138,6 +167,8 @@ function seedProfiles(): ScoreProfile[] {
 function seedSites(): Campsite[] {
   const base = {
     defaultProfileId: 1,
+    profilePending: false,
+    version: 1,
     createdAt: SEED_TS,
     updatedAt: SEED_TS
   }

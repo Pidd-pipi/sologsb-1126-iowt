@@ -44,6 +44,8 @@ export interface ScoreProfile {
   season: string
   /** 是否为当前启用方案 */
   active: boolean
+  /** 乐观并发版本号：每次保存自增，用于多人同时编辑时的版本核对 */
+  version: number
   note: string
   createdAt: string
   updatedAt: string

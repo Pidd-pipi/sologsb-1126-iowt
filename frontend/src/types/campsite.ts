@@ -48,8 +48,12 @@ export interface Campsite {
   flatness: number
   /** 进出方式 */
   access: AccessMode
-  /** 该营位默认采用的权重方案 id（v3 迁移时回填） */
+  /** 该营位默认采用的权重方案 id（v3 迁移时回填）；null 表示待选择方案 */
   defaultProfileId: number | null
+  /** 是否处于「待选择方案」状态：引用的方案被停用或移除后置 true，不可静默换回别的方案 */
+  profilePending: boolean
+  /** 乐观并发版本号：每次保存自增，用于多人同时编辑时的版本核对 */
+  version: number
   /** 备注 */
   note: string
   createdAt: string

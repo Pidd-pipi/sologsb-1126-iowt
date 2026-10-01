@@ -2,18 +2,22 @@
 /**
  * `/` 营位名次表 —— 按综合得分从高到低排序，展示坡度、水源距离、信号与等级，
  * 可按营地 / 地表类型 / 进出方式筛选，命中否决项的营位整行标红。
- * 消费 Campsite、FactorAssessment、RiskVeto；复用 <GradeBadge>、<EmptyState>。
+ * 消费 Campsite、FactorAssessment、RiskVeto、ScoreProfile；复用 <GradeBadge>、<EmptyState>、<ConflictHistory>。
+ * 引用方案被停用/移除的营位转入「待选择」，不可静默回退；名次表保留冲突记录。
  */
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useSiteStore } from '@/stores/siteStore'
 import { useProfileStore } from '@/stores/profileStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { useRanking } from '@/hooks/useRanking'
 import { FACTOR_META } from '@/types/score'
 import { SURFACE_TYPES, ACCESS_MODES } from '@/types/campsite'
 import GradeBadge from '@/components/common/GradeBadge.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
+import ConflictHistory from '@/components/common/ConflictHistory.vue'
 import { formatScore } from '@/utils/format'
 import { NORMALIZE_LABELS } from '@/types/score'
 
@@ -21,6 +25,11 @@ const router = useRouter()
 const siteStore = useSiteStore()
 const profileStore = useProfileStore()
 const uiStore = useUiStore()
+const conflictStore = useConflictStore()
+
+onMounted(() => {
+  void conflictStore.load()
+})
 
 const inputSites = computed(() =>
   siteStore.list.filter((site) => {
@@ -76,6 +85,21 @@ const activeNormalize = computed(() =>
   profileStore.activeProfile ? NORMALIZE_LABELS[profileStore.activeProfile.normalize] : '—'
 )
 
+/** 处于待选择方案状态的营位（引用的方案被停用/移除） */
+const pendingSites = computed(() => siteStore.pendingSites)
+
+/** 为待选择营位指定新方案 */
+async function assignProfile(siteId: number, profileId: number): Promise<void> {
+  if (typeof siteId !== 'number' || typeof profileId !== 'number') return
+  const site = siteStore.byId(siteId)
+  const result = await siteStore.assignProfile(siteId, profileId, site?.version)
+  if (result.conflict) {
+    ElMessage.warning('营位信息已被别处修改，请刷新后重试')
+    return
+  }
+  ElMessage.success('已指定新方案，名次已重算')
+}
+
 function openDetail(siteId: number | undefined): void {
   if (typeof siteId !== 'number') return
   void router.push(`/sites/${siteId}`)
@@ -123,6 +147,37 @@ function openDetail(siteId: number | undefined): void {
         <div class="stat-card__extra">{{ stats.topName }}</div>
       </div>
     </div>
+
+    <el-alert
+      v-if="pendingSites.length"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="pending-alert"
+      title="有营位处于「待选择方案」状态"
+      description="以下营位引用的权重方案已被停用或移除，不会静默回退到别的方案。请为它们指定新方案后再查看名次。"
+    >
+      <div class="pending-list">
+        <div v-for="s in pendingSites" :key="s.id" class="pending-item">
+          <span class="pending-item__name">{{ s.code }} · {{ s.name }}</span>
+          <el-select
+            :model-value="null"
+            placeholder="选择方案"
+            size="small"
+            style="width: 200px"
+            @update:model-value="(v: number) => assignProfile(s.id!, v)"
+          >
+            <el-option
+              v-for="p in profileStore.list"
+              :key="p.id"
+              :label="`${p.name}${p.active ? '（启用中）' : ''}`"
+              :value="p.id"
+            />
+          </el-select>
+          <el-button size="small" text @click="openDetail(s.id)">详情</el-button>
+        </div>
+      </div>
+    </el-alert>
 
     <section class="panel">
       <div class="panel__head">
@@ -263,6 +318,14 @@ function openDetail(siteId: number | undefined): void {
         @action="router.push('/sites/new')"
       />
     </section>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2>冲突记录</h2>
+        <span class="weight-note">多人同时编辑、方案停用/移除时的版本核对与处理留痕</span>
+      </div>
+      <ConflictHistory entity-type="site" :entity-id="null" :limit="10" />
+    </section>
   </div>
 </template>
 
@@ -306,5 +369,24 @@ function openDetail(siteId: number | undefined): void {
 }
 .mr6 {
   margin-right: 6px;
+}
+.pending-alert {
+  margin: 0;
+}
+.pending-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.pending-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.pending-item__name {
+  font-weight: 600;
+  min-width: 200px;
 }
 </style>
