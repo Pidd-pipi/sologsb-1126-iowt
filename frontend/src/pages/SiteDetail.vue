@@ -10,9 +10,13 @@ import MapPanel from '@/components/common/MapPanel.vue'
 import FactorScoreBar from '@/components/common/FactorScoreBar.vue'
 import GradeBadge from '@/components/common/GradeBadge.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
+import ProfileAssignmentPanel from '@/components/common/ProfileAssignmentPanel.vue'
+import ConflictHistory from '@/components/common/ConflictHistory.vue'
+import ConflictResolveDialog from '@/components/common/ConflictResolveDialog.vue'
 import { useSiteStore } from '@/stores/siteStore'
 import { useProfileStore } from '@/stores/profileStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { useRanking } from '@/hooks/useRanking'
 import { FACTOR_META, NORMALIZE_LABELS } from '@/types/score'
 import { ASPECT_TYPES, SURFACE_TYPES, ACCESS_MODES } from '@/types/campsite'
@@ -30,6 +34,7 @@ const router = useRouter()
 const siteStore = useSiteStore()
 const profileStore = useProfileStore()
 const uiStore = useUiStore()
+const conflictStore = useConflictStore()
 
 const siteId = computed(() => Number(route.params.id))
 const site = computed(() => siteStore.byId(siteId.value))
@@ -37,16 +42,16 @@ const site = computed(() => siteStore.byId(siteId.value))
 const { scoreOf } = useRanking({
   sites: () => siteStore.list,
   factorOf: (id: number) => siteStore.latestFactor(id),
-  weights: () => profileStore.activeWeights,
-  normalize: () => profileStore.activeProfile?.normalize ?? 'minmax',
-  thresholds: () => profileStore.activeProfile?.thresholds ?? { gradeA: 78, gradeB: 58 },
+  assignmentOf: (s) => profileStore.assignmentOf(s),
   vetoedIds: () => uiStore.vetoedSiteIds
 })
 
 const scoreRow = computed(() => scoreOf(siteId.value))
 
-/** 供 MapPanel 与地图标记回调使用（避免在模板里写带类型标注的箭头函数） */
-function gradeOfSite(id: number): Grade {
+/** 供 MapPanel 与地图标记回调使用（待选择营位在地图上显示灰色「待」标记） */
+function gradeOfSite(id: number): Grade | 'pending' {
+  const target = siteStore.byId(id)
+  if (target && profileStore.assignmentOf(target).pending) return 'pending'
   return scoreOf(id)?.grade ?? 'C'
 }
 
@@ -56,6 +61,51 @@ function openSite(id: number): void {
 const grade = computed(() => scoreRow.value?.grade ?? 'C')
 const factorHistory = computed(() => siteStore.factorsOf(siteId.value))
 const vetoList = computed(() => uiStore.vetosOf(siteId.value))
+const assignment = computed(() => profileStore.assignmentOf(site.value))
+const siteConflicts = computed(() => conflictStore.ofSite(siteId.value))
+
+/* --------------------------- 营位指定冲突合并 --------------------------- */
+const dialogVisible = ref(false)
+const activeConflictId = ref<number | null>(null)
+const activeConflict = computed(() =>
+  activeConflictId.value == null
+    ? null
+    : conflictStore.list.find((c) => c.id === activeConflictId.value) ?? null
+)
+
+function openConflict(id: number): void {
+  activeConflictId.value = id
+  dialogVisible.value = true
+}
+
+async function onMergeSite(conflictId: number, profileId: number | null): Promise<void> {
+  await siteStore.resolveAssignmentConflict(conflictId, profileId)
+  ElMessage.success('营位指定已合并，名次已按最新方案重算')
+}
+
+async function onMergeProfile(conflictId: number, merged: import('@/utils/conflict').ProfileContent): Promise<void> {
+  const result = await profileStore.resolveProfileConflict(conflictId, merged)
+  if (result.ok) ElMessage.success('双方方案改动已合并启用，受影响营位已统一重算')
+}
+
+async function onDiscardConflict(conflictId: number): Promise<void> {
+  await conflictStore.markMerged(conflictId, '已放弃本地草稿')
+  ElMessage.info('已放弃本地草稿')
+}
+
+async function onSaveAsNew(
+  conflictId: number,
+  content: import('@/utils/conflict').ProfileContent
+): Promise<void> {
+  const id = await profileStore.createProfile({ ...content, active: true })
+  await profileStore.activate(id)
+  await conflictStore.markMerged(conflictId, `权重草稿另存为新方案「${content.name}」并启用`)
+  ElMessage.success(`已另存为「${content.name}」并启用`)
+}
+
+function profileNameOf(id: number | null): string {
+  return profileStore.byId(id)?.name ?? (id == null ? '待选择' : `方案 #${id}`)
+}
 
 /* --------------------------- 多轮因子复核录入 --------------------------- */
 const showFactorForm = ref(false)
@@ -259,6 +309,25 @@ watch(
       :description="vetoList.map((v) => `${v.type}：${v.description}`).join(' ｜ ')"
     />
 
+    <el-alert
+      v-if="assignment.pending"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="detail-alert"
+      title="该营位处于「待选择」：未指定评分方案或所引方案已停用/移除"
+      description="此状态下不参与名次与等级计算，也不会自动换回别的方案；请在下方显式指定一个方案后重算。"
+    />
+    <el-alert
+      v-else-if="assignment.stale"
+      type="info"
+      show-icon
+      :closable="false"
+      class="detail-alert"
+      title="指定方案内容被调整过，该营位的名次已按最新版本失效重算"
+      description="变化明细见页面底部的并发改动记录。"
+    />
+
     <MapPanel
       :sites="siteStore.list"
       :selected-id="siteId"
@@ -271,15 +340,26 @@ watch(
     <div class="stat-row">
       <div class="stat-card">
         <div class="stat-card__label">综合得分</div>
-        <div class="stat-card__value">{{ scoreRow?.total ?? '—' }}</div>
-        <div class="stat-card__extra">方案 {{ profileStore.activeProfile?.name ?? '—' }}</div>
+        <div class="stat-card__value">{{ assignment.pending ? '待选择' : (scoreRow?.total ?? '—') }}</div>
+        <div class="stat-card__extra">
+          方案 {{ assignment.profile?.name ?? '—' }}
+          <template v-if="!assignment.pending"> · v{{ assignment.profile?.version }}</template>
+        </div>
       </div>
       <div class="stat-card">
         <div class="stat-card__label">推荐等级</div>
         <div class="stat-card__value">
-          <GradeBadge :grade="grade" size="large" :vetoed="vetoList.length > 0" />
+          <GradeBadge
+            v-if="!assignment.pending"
+            :grade="grade"
+            size="large"
+            :vetoed="vetoList.length > 0"
+          />
+          <el-tag v-else type="warning" size="large">待选择</el-tag>
         </div>
-        <div class="stat-card__extra">名次第 {{ scoreRow?.rank ?? '—' }} 位</div>
+        <div class="stat-card__extra">
+          {{ assignment.pending ? '指定方案后参与排名' : `名次第 ${scoreRow?.rank ?? '—'} 位` }}
+        </div>
       </div>
       <div class="stat-card">
         <div class="stat-card__label">坐标</div>
@@ -292,6 +372,14 @@ watch(
         <div class="stat-card__extra">否决项 {{ vetoList.length }} 条</div>
       </div>
     </div>
+
+    <section class="panel">
+      <div class="panel__head">
+        <h2>评分方案指定</h2>
+        <span class="weight-note">该营位按指定方案评分；方案停用或移除后转入待选择，不会被悄悄换方案</span>
+      </div>
+      <ProfileAssignmentPanel :site="site" @conflict="openConflict" />
+    </section>
 
     <section v-if="editing" class="panel">
       <div class="panel__head">
@@ -377,12 +465,17 @@ watch(
       <div class="panel__head">
         <h2>因子打分表</h2>
         <span class="weight-note">
-          归一方式：{{ profileStore.activeProfile ? NORMALIZE_LABELS[profileStore.activeProfile.normalize] : '—' }}
-          · 等级阈值 A ≥ {{ profileStore.activeProfile?.thresholds.gradeA ?? 78 }} / B ≥
-          {{ profileStore.activeProfile?.thresholds.gradeB ?? 58 }}
+          <template v-if="scoreRow">
+            方案：{{ scoreRow.profile.name }}（v{{ scoreRow.profile.version }}） ·
+            归一方式：{{ NORMALIZE_LABELS[scoreRow.profile.normalize] }}
+            · 等级阈值 A ≥ {{ scoreRow.profile.thresholds.gradeA }} / B ≥
+            {{ scoreRow.profile.thresholds.gradeB }}
+            <el-tag v-if="scoreRow.stale" type="warning" size="small" class="ml6">方案改动后已重算</el-tag>
+          </template>
+          <template v-else>该营位待选择方案，指定方案后显示评分明细</template>
         </span>
       </div>
-      <div class="factor-grid">
+      <div v-if="scoreRow" class="factor-grid">
         <FactorScoreBar
           v-for="row in factorRows"
           :key="row.key"
@@ -396,10 +489,11 @@ watch(
           :contribution="row.contribution"
         />
       </div>
-      <p class="panel__hint">
+      <p v-if="scoreRow" class="panel__hint">
         当前名次所用因子来自最新一轮评估（{{ siteStore.latestFactor(siteId)?.assessedAt ?? '暂无' }}，
         评估人 {{ siteStore.latestFactor(siteId)?.assessor ?? '—' }}）。
       </p>
+      <p v-else class="panel__hint">该营位未参与评分：请先在上方「评分方案指定」中选择一个有效方案。</p>
     </section>
 
     <section class="panel">
@@ -616,6 +710,23 @@ watch(
         </el-form-item>
       </el-form>
     </section>
+
+    <ConflictHistory
+      :conflicts="siteConflicts"
+      title="本营位的并发改动与重算记录"
+      :show-site="false"
+      @resolve="(c) => openConflict(c.id as number)"
+    />
+
+    <ConflictResolveDialog
+      v-model="dialogVisible"
+      :conflict="activeConflict"
+      :profile-name-of="profileNameOf"
+      @merge-profile="(c, merged) => onMergeProfile(c.id as number, merged)"
+      @merge-site="(c, pid) => onMergeSite(c.id as number, pid)"
+      @discard="(c) => onDiscardConflict(c.id as number)"
+      @save-as-new="(c, content) => onSaveAsNew(c.id as number, content)"
+    />
   </div>
 
   <div v-else class="page">
@@ -646,5 +757,11 @@ watch(
 }
 .review-form {
   margin-bottom: 12px;
+}
+.detail-alert {
+  margin-bottom: 12px;
+}
+.ml6 {
+  margin-left: 6px;
 }
 </style>

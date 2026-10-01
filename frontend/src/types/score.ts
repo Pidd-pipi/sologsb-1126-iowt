@@ -44,6 +44,14 @@ export interface ScoreProfile {
   season: string
   /** 是否为当前启用方案 */
   active: boolean
+  /**
+   * 乐观锁版本号（v4 起）：内容（权重/归一方式/阈值/季节/名称/备注）每被保存或合并
+   * 一次就 +1。营位保存指定方案时记下当时的版本，之后据此核对方案是否被别人改过。
+   * 启用/停用切换不改版本。
+   */
+  version: number
+  /** 停用时间；停用（含被移除）时置为时间串，方案不再参与评分。null 表示在用。 */
+  retiredAt: string | null
   note: string
   createdAt: string
   updatedAt: string

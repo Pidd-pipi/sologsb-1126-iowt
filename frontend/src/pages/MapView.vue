@@ -40,12 +40,10 @@ const visibleSites = computed(() =>
   })
 )
 
-const { ranked, scoreOf } = useRanking({
+const { ranked, scoreOf, pending } = useRanking({
   sites: () => siteStore.list,
   factorOf: (id: number) => siteStore.latestFactor(id),
-  weights: () => profileStore.activeWeights,
-  normalize: () => profileStore.activeProfile?.normalize ?? 'minmax',
-  thresholds: () => profileStore.activeProfile?.thresholds ?? { gradeA: 78, gradeB: 58 },
+  assignmentOf: (s) => profileStore.assignmentOf(s),
   vetoedIds: () => uiStore.vetoedSiteIds
 })
 
@@ -87,7 +85,9 @@ function onPanelMode(payload: { degraded: boolean; reason: string }): void {
   panelReason.value = payload.reason
 }
 
-function gradeOfSite(id: number): Grade {
+function gradeOfSite(id: number): Grade | 'pending' {
+  const target = siteStore.byId(id)
+  if (target && profileStore.assignmentOf(target).pending) return 'pending'
   return scoreOf(id)?.grade ?? 'C'
 }
 

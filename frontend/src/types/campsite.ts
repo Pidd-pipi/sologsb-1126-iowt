@@ -48,8 +48,25 @@ export interface Campsite {
   flatness: number
   /** 进出方式 */
   access: AccessMode
-  /** 该营位默认采用的权重方案 id（v3 迁移时回填） */
+  /**
+   * 该营位采用的权重方案 id（v3 回填；v4 起同时承担「营位指定」）。
+   * 方案被移除时保留最后指向的 id 以便提示「原方案已移除」（用 pendingReason 标记），
+   * 新营位未指定时为 null。
+   */
   defaultProfileId: number | null
+  /**
+   * 指定方案时的内容版本（v4 新增），即 ScoreProfile.version 的快照。
+   * 保存营位指定时记下；若随后方案内容被改，版本对不上 → 该营位名次失效、需重算。
+   */
+  assignedProfileVersion: number | null
+  /**
+   * 待选择原因（v4 新增）：
+   *  - 无该字段/为空：方案有效，正常参与排名（或新营位尚未指定时由 defaultProfileId=null 判定）
+   *  - 'retired'：原方案被停用（defaultProfileId 仍指向它）
+   *  - 'removed'：原方案被移除（defaultProfileId 保留最后指向）
+   * 重新指定有效方案后清空。
+   */
+  pendingReason: '' | 'retired' | 'removed'
   /** 备注 */
   note: string
   createdAt: string

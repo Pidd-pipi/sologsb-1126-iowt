@@ -1,26 +1,35 @@
 <script setup lang="ts">
 /**
- * `/` 营位名次表 —— 按综合得分从高到低排序，展示坡度、水源距离、信号与等级，
- * 可按营地 / 地表类型 / 进出方式筛选，命中否决项的营位整行标红。
- * 消费 Campsite、FactorAssessment、RiskVeto；复用 <GradeBadge>、<EmptyState>。
+ * `/` 营位名次表 —— 按每个营位「指定的权重方案」加权评分并降序排列；
+ * 未指定 / 方案停用或移除的营位进入「待选择」区，不参与排名、不悄悄换方案；
+ * 方案改动后已重算的营位与名次行给出标记；页面底部保留并发改动与重算记录。
+ * 消费 Campsite、FactorAssessment、RiskVeto、ChangeConflict；复用 <GradeBadge>、<EmptyState>。
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { useSiteStore } from '@/stores/siteStore'
 import { useProfileStore } from '@/stores/profileStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useConflictStore } from '@/stores/conflictStore'
 import { useRanking } from '@/hooks/useRanking'
 import { FACTOR_META } from '@/types/score'
 import { SURFACE_TYPES, ACCESS_MODES } from '@/types/campsite'
 import GradeBadge from '@/components/common/GradeBadge.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
+import ProfileAssignmentPanel from '@/components/common/ProfileAssignmentPanel.vue'
+import ConflictHistory from '@/components/common/ConflictHistory.vue'
+import ConflictResolveDialog from '@/components/common/ConflictResolveDialog.vue'
 import { formatScore } from '@/utils/format'
 import { NORMALIZE_LABELS } from '@/types/score'
+import type { ChangeConflict } from '@/types/conflict'
+import type { ProfileContent } from '@/utils/conflict'
 
 const router = useRouter()
 const siteStore = useSiteStore()
 const profileStore = useProfileStore()
 const uiStore = useUiStore()
+const conflictStore = useConflictStore()
 
 const inputSites = computed(() =>
   siteStore.list.filter((site) => {
@@ -36,12 +45,10 @@ const inputSites = computed(() =>
   })
 )
 
-const { ranked } = useRanking({
+const { ranked, pending } = useRanking({
   sites: () => inputSites.value,
   factorOf: (siteId: number) => siteStore.latestFactor(siteId),
-  weights: () => profileStore.activeWeights,
-  normalize: () => profileStore.activeProfile?.normalize ?? 'minmax',
-  thresholds: () => profileStore.activeProfile?.thresholds ?? { gradeA: 78, gradeB: 58 },
+  assignmentOf: (site) => profileStore.assignmentOf(site),
   vetoedIds: () => uiStore.vetoedSiteIds
 })
 
@@ -55,9 +62,10 @@ function normalizedOf(
   return row.rows.find((r) => r.key === key)?.normalized ?? '—'
 }
 
-/** 命中否决项的营位整行标红 */
-function rowClass({ row }: { row: { vetoed: boolean } }): string {
-  return row.vetoed ? 'veto-row' : ''
+/** 命中否决项的营位整行标红；方案改动后重算的行追加提示样式 */
+function rowClass({ row }: { row: { vetoed: boolean; stale: boolean } }): string {
+  if (row.vetoed) return 'veto-row'
+  return row.stale ? 'stale-row' : ''
 }
 
 const stats = computed(() => {
@@ -71,10 +79,67 @@ const stats = computed(() => {
   }
 })
 
-const activeProfileName = computed(() => profileStore.activeProfile?.name ?? '—')
-const activeNormalize = computed(() =>
-  profileStore.activeProfile ? NORMALIZE_LABELS[profileStore.activeProfile.normalize] : '—'
+const activeProfileName = computed(() => profileStore.activeProfile?.name ?? '无启用方案')
+
+const pendingInScope = computed(() => pending.value)
+
+const siteConflicts = computed(() =>
+  // 与营位相关的记录（停用/移除/重算/营位冲突）都带 siteId；
+  // 方案保存冲突没有具体营位，但名次表作为总览页也需要能处理，故一并展示。
+  conflictStore.list.filter((c) => typeof c.siteId === 'number' || c.resource === 'profile')
 )
+
+/** 名次表上的待合并冲突（含方案类，供直接打开合并） */
+const dialogVisible = ref(false)
+const activeConflictId = ref<number | null>(null)
+const activeConflict = computed(() =>
+  activeConflictId.value == null
+    ? null
+    : conflictStore.list.find((c) => c.id === activeConflictId.value) ?? null
+)
+
+function openConflict(id: number): void {
+  activeConflictId.value = id
+  dialogVisible.value = true
+}
+
+async function onMergeProfile(conflict: ChangeConflict, merged: ProfileContent): Promise<void> {
+  const id = typeof conflict.id === 'number' ? conflict.id : -1
+  const result = await profileStore.resolveProfileConflict(id, merged)
+  if (result.ok) {
+    ElMessage.success('双方权重调整已合并并启用，受影响营位已统一重算')
+  } else if (result.missing) {
+    ElMessage.warning('原方案已停用或移除，请改用「另存为新方案」')
+  }
+}
+
+async function onMergeSite(conflict: ChangeConflict, profileId: number | null): Promise<void> {
+  if (typeof conflict.id !== 'number') return
+  await siteStore.resolveAssignmentConflict(conflict.id, profileId)
+  ElMessage.success('营位指定已合并，名次已按最新方案重算')
+}
+
+async function onDiscard(conflict: ChangeConflict): Promise<void> {
+  if (typeof conflict.id !== 'number') return
+  await conflictStore.markMerged(conflict.id, '已放弃本地草稿，保留先保存的一方')
+  ElMessage.info('已放弃本地草稿')
+}
+
+async function onSaveAsNew(conflict: ChangeConflict, content: ProfileContent): Promise<void> {
+  const id = await profileStore.createProfile({
+    ...content,
+    active: true
+  })
+  await profileStore.activate(id)
+  if (typeof conflict.id === 'number') {
+    await conflictStore.markMerged(conflict.id, `权重草稿已另存为新方案「${content.name}」并启用`)
+  }
+  ElMessage.success(`已另存为新方案「${content.name}」并启用；引用旧方案的营位仍需重新指定`)
+}
+
+function profileNameOf(id: number | null): string {
+  return profileStore.byId(id)?.name ?? (id == null ? '待选择' : `方案 #${id}`)
+}
 
 function openDetail(siteId: number | undefined): void {
   if (typeof siteId !== 'number') return
@@ -101,14 +166,14 @@ function openDetail(siteId: number | undefined): void {
 
     <div class="stat-row">
       <div class="stat-card">
-        <div class="stat-card__label">候选营位</div>
+        <div class="stat-card__label">参与排名</div>
         <div class="stat-card__value" data-testid="stat-total">{{ stats.total }}</div>
-        <div class="stat-card__extra">共 {{ siteStore.total }} 个已登记</div>
+        <div class="stat-card__extra">共 {{ siteStore.total }} 个已登记 · {{ pendingInScope.length }} 个待选择</div>
       </div>
       <div class="stat-card">
         <div class="stat-card__label">A 级推荐</div>
         <div class="stat-card__value">{{ stats.gradeA }}</div>
-        <div class="stat-card__extra">阈值来自当前方案</div>
+        <div class="stat-card__extra">阈值来自各营位指定方案</div>
       </div>
       <div class="stat-card">
         <div class="stat-card__label">命中否决</div>
@@ -118,17 +183,42 @@ function openDetail(siteId: number | undefined): void {
         <div class="stat-card__extra">否决后禁止评 A</div>
       </div>
       <div class="stat-card">
+        <div class="stat-card__label">待合并改动</div>
+        <div class="stat-card__value" :style="{ color: conflictStore.openCount ? '#b91c1c' : undefined }">
+          {{ conflictStore.openCount }}
+        </div>
+        <div class="stat-card__extra">合并后统一启用重算</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-card__label">最高综合得分</div>
         <div class="stat-card__value">{{ formatScore(stats.top) }}</div>
         <div class="stat-card__extra">{{ stats.topName }}</div>
       </div>
     </div>
 
+    <el-alert
+      v-if="pendingInScope.length"
+      type="warning"
+      :closable="false"
+      show-icon
+      class="pending-alert"
+      :title="`${pendingInScope.length} 个营位处于「待选择」：未指定方案或所引方案已停用/移除，不参与名次，也未自动换用其它方案`"
+    />
+
+    <el-alert
+      v-if="ranked.some((r) => r.stale)"
+      type="info"
+      :closable="false"
+      show-icon
+      class="pending-alert"
+      title="部分营位的指定方案内容被调整过，相关名次已失效并按最新方案重算（行内有「已重算」标记，记录见页面底部）"
+    />
+
     <section class="panel">
       <div class="panel__head">
         <h2>筛选条件</h2>
         <span class="weight-note">
-          当前方案：{{ activeProfileName }} · 归一方式：{{ activeNormalize }}
+          全局启用方案：{{ activeProfileName }} · 各营位按其指定方案评分
         </span>
       </div>
       <div class="filters">
@@ -190,6 +280,15 @@ function openDetail(siteId: number | undefined): void {
               <span class="site-cell__sub">
                 {{ row.site.campName }} · 海拔 {{ row.site.elevation }} m · 容 {{ row.site.tentCapacity }} 帐
               </span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="评分方案" width="170">
+          <template #default="{ row }">
+            <span class="profile-name">{{ row.profile.name }}</span>
+            <el-tag v-if="row.stale" type="warning" size="small" class="ml6">已重算</el-tag>
+            <div class="cell-sub">
+              {{ NORMALIZE_LABELS[row.profile.normalize as 'minmax' | 'threshold'] }} · v{{ row.profile.version }}
             </div>
           </template>
         </el-table-column>
@@ -263,6 +362,44 @@ function openDetail(siteId: number | undefined): void {
         @action="router.push('/sites/new')"
       />
     </section>
+
+    <section v-if="pendingInScope.length" class="panel">
+      <div class="panel__head">
+        <h2>待选择方案的营位（{{ pendingInScope.length }}）</h2>
+        <span class="weight-note">不参与名次与等级；方案停用/移除后不会被悄悄换成别的方案</span>
+      </div>
+      <el-table :data="pendingInScope" size="small" border>
+        <el-table-column label="营位" min-width="220">
+          <template #default="{ row }">
+            <el-link type="primary" underline="never" @click="openDetail(row.site.id)">
+              {{ row.site.code }} · {{ row.site.name }}
+            </el-link>
+            <div class="cell-sub">{{ row.site.campName }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="当前状态" min-width="360">
+          <template #default="{ row }">
+            <ProfileAssignmentPanel :site="row.site" compact />
+          </template>
+        </el-table-column>
+      </el-table>
+    </section>
+
+    <ConflictHistory
+      :conflicts="siteConflicts"
+      :limit="30"
+      @resolve="(c) => openConflict(c.id as number)"
+    />
+
+    <ConflictResolveDialog
+      v-model="dialogVisible"
+      :conflict="activeConflict"
+      :profile-name-of="profileNameOf"
+      @merge-profile="onMergeProfile"
+      @merge-site="onMergeSite"
+      @discard="onDiscard"
+      @save-as-new="onSaveAsNew"
+    />
   </div>
 </template>
 
@@ -306,5 +443,15 @@ function openDetail(siteId: number | undefined): void {
 }
 .mr6 {
   margin-right: 6px;
+}
+.pending-alert {
+  margin-bottom: 14px;
+}
+.profile-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+:deep(.stale-row) {
+  background-color: #fdf6ec !important;
 }
 </style>

@@ -1,19 +1,23 @@
 <script setup lang="ts">
 /**
  * 应用外壳：顶部导航 + 全局统计 + 页脚存储说明。
- * 挂载时并行加载四张表（sites / factors / profiles / vetos），保证各页面首屏即有数据。
+ * 挂载时并行加载五张表（sites / factors / profiles / vetos / conflicts），保证各页面首屏即有数据。
+ * 订阅 syncBus：规划员与领队在不同页签同时编辑时，任一方写库后另一方自动刷新到最新版本。
  */
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute } from 'vue-router'
 import { useSiteStore } from '@/stores/siteStore'
 import { useProfileStore } from '@/stores/profileStore'
 import { useUiStore } from '@/stores/uiStore'
+import { useConflictStore } from '@/stores/conflictStore'
+import { onDataChange, type SyncMessage } from '@/utils/syncBus'
 import { resolveAmapKey } from '@/hooks/useAmapLoader'
 
 const route = useRoute()
 const siteStore = useSiteStore()
 const profileStore = useProfileStore()
 const uiStore = useUiStore()
+const conflictStore = useConflictStore()
 
 const activeMenu = computed(() => {
   const path = route.path
@@ -33,9 +37,29 @@ onMounted(async () => {
   await Promise.all([
     siteStore.load(),
     profileStore.load(),
-    uiStore.loadVetos()
+    uiStore.loadVetos(),
+    conflictStore.load()
   ])
+
+  // 其它页签（或本页签其它 store）写库后，按实体增量刷新，保证版本核对基于最新数据。
+  const unsubscribe = onDataChange(handleSync)
+  onBeforeUnmount(unsubscribe)
 })
+
+function handleSync(msg: SyncMessage): void {
+  if (msg.entity === 'all' || msg.entity === 'sites' || msg.entity === 'factors') {
+    void siteStore.load()
+  }
+  if (msg.entity === 'all' || msg.entity === 'profiles') {
+    void profileStore.load()
+  }
+  if (msg.entity === 'all' || msg.entity === 'vetos') {
+    void uiStore.loadVetos()
+  }
+  if (msg.entity === 'all' || msg.entity === 'conflicts') {
+    void conflictStore.load()
+  }
+}
 </script>
 
 <template>
@@ -56,6 +80,9 @@ onMounted(async () => {
         <el-menu-item index="/veto">风险否决</el-menu-item>
       </el-menu>
       <div class="app-aside">
+        <el-tag v-if="conflictStore.openCount" type="danger" effect="dark" size="small">
+          {{ conflictStore.openCount }} 处改动待合并
+        </el-tag>
         <el-tag type="info" effect="plain" size="small">{{ mapModeText }}</el-tag>
         <span class="app-stat">
           营位 {{ siteStore.total }} · 方案 {{ profileStore.total }} · 否决 {{ uiStore.vetoTotal }}

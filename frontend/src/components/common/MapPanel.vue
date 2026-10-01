@@ -19,8 +19,8 @@ const props = withDefaults(
     sites: Campsite[]
     /** 当前选中营位 id */
     selectedId?: number | null
-    /** 每个营位的等级，用于着色 */
-    gradeOf?: (siteId: number) => Grade
+    /** 每个营位的等级，用于着色；'pending' = 待选择方案（灰色「待」标记） */
+    gradeOf?: (siteId: number) => Grade | 'pending'
     /** pick 模式下点击空白处会抛出经纬度（用于选点登记） */
     mode?: 'view' | 'pick'
     /** 地图高度 */
@@ -36,6 +36,11 @@ const props = withDefaults(
     title: '营位分布'
   }
 )
+
+const MARKER_COLOR: Record<Grade | 'pending', string> = {
+  ...GRADE_COLOR,
+  pending: '#6b7280'
+}
 
 const emit = defineEmits<{
   (e: 'select', siteId: number): void
@@ -58,8 +63,14 @@ const bounds = computed(() => boundsOf(props.sites.map((s) => ({ lng: s.lng, lat
 const points = computed(() =>
   props.sites.map((site) => {
     const pt = projectToGrid({ lng: site.lng, lat: site.lat }, bounds.value, GRID_W, GRID_H)
-    const grade: Grade = props.gradeOf ? props.gradeOf(site.id ?? -1) : 'C'
-    return { site, x: pt.x, y: pt.y, color: GRADE_COLOR[grade], grade }
+    const grade: Grade | 'pending' = props.gradeOf ? props.gradeOf(site.id ?? -1) : 'C'
+    return {
+      site,
+      x: pt.x,
+      y: pt.y,
+      color: MARKER_COLOR[grade],
+      grade: grade === 'pending' ? '待' : grade
+    }
   })
 )
 
